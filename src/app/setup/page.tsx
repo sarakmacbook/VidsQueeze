@@ -483,36 +483,63 @@ export default function SetupPage() {
 
       {step === 3 && (
         <Card title="3 · How the bot listens" subtitle="Webhook for public deployments, long polling for local sandboxes">
+          {status && !status.platform.supportsLongPolling && (
+            <div className="mb-5">
+              <Alert tone="warn">
+                <b>{status.platform.name}</b> runs short-lived functions, so long polling cannot work here — the loop
+                would be frozen the moment a request finished. Use the <b>webhook</b> option below; it is the standard
+                mode for any public deployment and needs nothing but your HTTPS URL.
+              </Alert>
+            </div>
+          )}
           <div className="grid gap-5 lg:grid-cols-2">
             <div className={`rounded-2xl border p-4 ${settings.connectionMode === "polling" ? "border-cyan-400/50 bg-cyan-400/5" : "border-white/10 bg-black/25"}`}>
               <div className="flex items-center justify-between">
                 <h3 className="text-sm font-bold text-slate-100">Long polling</h3>
-                <Badge tone={status?.poller.running ? "green" : "slate"}>
-                  {status?.poller.running ? "running" : "stopped"}
+                <Badge
+                  tone={
+                    status && !status.platform.supportsLongPolling
+                      ? "red"
+                      : status?.poller.running
+                        ? "green"
+                        : "slate"
+                  }
+                >
+                  {status && !status.platform.supportsLongPolling
+                    ? "unavailable here"
+                    : status?.poller.running
+                      ? "running"
+                      : "stopped"}
                 </Badge>
               </div>
               <p className="mt-2 text-xs leading-relaxed text-slate-400">
                 The app calls <code className="rounded bg-white/10 px-1">getUpdates</code> in a loop. Works behind
                 localhost, Docker and sandboxes — no public URL or TLS needed.
               </p>
-              <div className="mt-3 flex flex-wrap gap-2">
-                {status?.poller.running ? (
-                  <button className="btn-danger" disabled={busy !== null} onClick={() => void pollAction("stop")}>
-                    ■ Stop listener
+              {status && !status.platform.supportsLongPolling ? (
+                <p className="mt-3 rounded-lg border border-rose-400/25 bg-rose-400/10 p-2.5 text-[11px] leading-relaxed text-rose-100">
+                  {status.platform.longPollingBlockedReason}
+                </p>
+              ) : (
+                <div className="mt-3 flex flex-wrap gap-2">
+                  {status?.poller.running ? (
+                    <button className="btn-danger" disabled={busy !== null} onClick={() => void pollAction("stop")}>
+                      ■ Stop listener
+                    </button>
+                  ) : (
+                    <button className="btn-primary" disabled={busy !== null} onClick={() => void pollAction("start")}>
+                      ▶ Start listener
+                    </button>
+                  )}
+                  <button
+                    className="btn-ghost"
+                    disabled={busy !== null}
+                    onClick={() => void save({ connectionMode: "polling" }, { silent: true })}
+                  >
+                    Set as default mode
                   </button>
-                ) : (
-                  <button className="btn-primary" disabled={busy !== null} onClick={() => void pollAction("start")}>
-                    ▶ Start listener
-                  </button>
-                )}
-                <button
-                  className="btn-ghost"
-                  disabled={busy !== null}
-                  onClick={() => void save({ connectionMode: "polling" }, { silent: true })}
-                >
-                  Set as default mode
-                </button>
-              </div>
+                </div>
+              )}
               {status?.poller.lastError && (
                 <p className="mt-3 rounded-lg border border-amber-400/25 bg-amber-400/10 p-2.5 text-[11px] text-amber-100">
                   {status.poller.lastError}
@@ -586,9 +613,17 @@ export default function SetupPage() {
             <div className="mt-5 grid gap-3 sm:grid-cols-3">
               <CheckRow ok={settings.tokenVerified} label="Token verified" detail={settings.botUsername ?? "—"} />
               <CheckRow
-                ok={status?.poller.running || settings.connectionMode === "webhook"}
+                ok={settings.connectionMode === "webhook" || Boolean(status?.poller.running)}
                 label="Listener"
-                detail={settings.connectionMode === "webhook" ? "webhook mode" : status?.poller.running ? "polling live" : "not started"}
+                detail={
+                  settings.connectionMode === "webhook"
+                    ? "webhook mode"
+                    : status?.poller.running
+                      ? "polling live"
+                      : status && !status.platform.supportsLongPolling
+                        ? "register the webhook"
+                        : "not started"
+                }
               />
               <CheckRow ok={Boolean(status?.ffmpeg.available)} label="ffmpeg" detail={status?.ffmpeg.version?.split(" ").slice(0, 2).join(" ") ?? "—"} />
             </div>
@@ -597,7 +632,9 @@ export default function SetupPage() {
           <Card title="Live Telegram test" subtitle="Everything is wired — just send a clip to the bot">
             <ol className="list-decimal space-y-2 pl-5 text-xs leading-relaxed text-slate-400">
               <li>
-                Start the listener in step 3 (or register the webhook if this deployment has a public HTTPS URL).
+                {status && !status.platform.supportsLongPolling
+                  ? "Register the webhook in step 3 — this host cannot run a long-polling loop."
+                  : "Start the listener in step 3 (or register the webhook if this deployment has a public HTTPS URL)."}
               </li>
               <li>
                 Open <b className="text-slate-200">{settings.botUsername ?? "your bot"}</b> in Telegram and press{" "}

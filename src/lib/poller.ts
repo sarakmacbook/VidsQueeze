@@ -1,6 +1,7 @@
 import { getRawToken, getSettingsRow, updateSettings } from "@/lib/settings";
 import { deleteWebhook, getUpdates, TelegramError } from "@/lib/telegram";
 import { handleTelegramUpdate, logEvent } from "@/lib/queue";
+import { longPollingBlockedReason, supportsLongPolling } from "@/lib/platform";
 
 type PollerState = {
   running: boolean;
@@ -77,6 +78,15 @@ async function loop(loopId: number): Promise<void> {
 }
 
 export async function startPolling(): Promise<{ started: boolean; error?: string }> {
+  // A polling loop only survives inside a process that never exits. Serverless
+  // platforms freeze the function the moment the HTTP response is sent, so the
+  // loop would silently stop after one request.
+  if (!supportsLongPolling()) {
+    const reason = longPollingBlockedReason() ?? "Long polling is not supported on this host.";
+    await logEvent("warn", "poller", reason);
+    return { started: false, error: reason };
+  }
+
   const token = await getRawToken();
   if (!token) return { started: false, error: "Add a bot token before starting the listener." };
 
@@ -109,6 +119,7 @@ export async function stopPolling(reason = "Stopped from the dashboard"): Promis
 
 /** Resume the listener after a server restart when it was left enabled. */
 export async function autoResume(): Promise<void> {
+  if (!supportsLongPolling()) return;
   try {
     const settings = await getSettingsRow();
     if (!settings.pollingActive || settings.connectionMode !== "polling") return;

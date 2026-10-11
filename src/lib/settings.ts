@@ -1,4 +1,5 @@
 import { db } from "@/db";
+import { ensureSchema } from "@/db/migrate";
 import { botSettings, type BotSettingsRow } from "@/db/schema";
 import { eq } from "drizzle-orm";
 
@@ -14,6 +15,10 @@ export function randomSecret(): string {
 }
 
 export async function getSettingsRow(): Promise<BotSettingsRow> {
+  // Every request path funnels through here, which makes it the natural place
+  // to guarantee the tables exist (a fresh Vercel Postgres has none).
+  await ensureSchema();
+
   const existing = await db
     .select()
     .from(botSettings)

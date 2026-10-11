@@ -6,13 +6,37 @@ import { formatBytes, formatDuration, type JobDTO } from "@/lib/shared";
 
 type Props = { compact?: boolean };
 
+type UploadLimits = {
+  maxUploadBytes: number;
+  platform: string;
+  serverless: boolean;
+  note: string | null;
+};
+
 export function TestBench({ compact = false }: Props) {
   const [file, setFile] = useState<File | null>(null);
   const [job, setJob] = useState<JobDTO | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [uploading, setUploading] = useState(false);
   const [dragging, setDragging] = useState(false);
+  const [limits, setLimits] = useState<UploadLimits | null>(null);
   const inputRef = useRef<HTMLInputElement>(null);
+
+  useEffect(() => {
+    let alive = true;
+    fetch("/api/compress", { cache: "no-store" })
+      .then((res) => (res.ok ? (res.json() as Promise<UploadLimits>) : null))
+      .then((data) => {
+        if (alive && data) setLimits(data);
+      })
+      .catch(() => undefined);
+    return () => {
+      alive = false;
+    };
+  }, []);
+
+  const maxBytes = limits?.maxUploadBytes ?? 300 * 1024 * 1024;
+  const tooBig = Boolean(file && file.size > maxBytes);
 
   useEffect(() => {
     if (!job) return;
@@ -29,6 +53,13 @@ export function TestBench({ compact = false }: Props) {
 
   const upload = useCallback(async () => {
     if (!file) return;
+    if (file.size > maxBytes) {
+      setError(
+        `${file.name} is ${formatBytes(file.size)}, but ${limits?.platform ?? "this host"} accepts at most ` +
+          `${formatBytes(maxBytes)} through the browser. ${limits?.note ?? ""}`.trim(),
+      );
+      return;
+    }
     setUploading(true);
     setError(null);
     setJob(null);
@@ -46,8 +77,7 @@ export function TestBench({ compact = false }: Props) {
     } finally {
       setUploading(false);
     }
-    }, [file]);
-  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [file, maxBytes, limits]);
 
   const running = job ? ["queued", "downloading", "processing", "uploading"].includes(job.status) : false;
   const saved =
@@ -89,15 +119,15 @@ export function TestBench({ compact = false }: Props) {
         <p className="mt-2 text-sm font-semibold text-slate-200">
           {file ? file.name : "Drop a .MOV / .MP4 clip here"}
         </p>
-        <p className="mt-1 text-[11px] text-slate-500">
+        <p className={`mt-1 text-[11px] ${tooBig ? "font-semibold text-rose-300" : "text-slate-500"}`}>
           {file
-            ? formatBytes(file.size)
-            : "Max 300 MB · the file never leaves this server, it is encoded locally with ffmpeg"}
+            ? `${formatBytes(file.size)}${tooBig ? ` · exceeds the ${formatBytes(maxBytes)} limit on ${limits?.platform ?? "this host"}` : ""}`
+            : `Max ${formatBytes(maxBytes)} on ${limits?.platform ?? "this host"} · the file never leaves the server, it is encoded locally with ffmpeg`}
         </p>
       </div>
 
       <div className="mt-4 flex flex-wrap items-center gap-3">
-        <button className="btn-primary" disabled={!file || uploading || running} onClick={() => void upload()}>
+        <button className="btn-primary" disabled={!file || tooBig || uploading || running} onClick={() => void upload()}>
           {uploading ? "Uploading…" : running ? "Encoding…" : "⚡ Compress now"}
         </button>
         {file && (
@@ -111,6 +141,17 @@ export function TestBench({ compact = false }: Props) {
           </span>
         )}
       </div>
+
+      {limits?.serverless && !error && (
+        <div className="mt-4">
+          <Alert tone="info">
+            <b>{limits.platform}</b> caps a function&apos;s request body at 4.5 MB, so the browser bench is limited to
+            small clips here. The Telegram bot is unaffected — it downloads and uploads through Telegram&apos;s own
+            servers, never through this request. Run VidSqueeze on a long-lived host (Docker, VPS, Fly.io) for the full
+            300 MB bench.
+          </Alert>
+        </div>
+      )}
 
       {error && (
         <div className="mt-4">

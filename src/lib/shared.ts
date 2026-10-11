@@ -68,6 +68,22 @@ export type EventDTO = {
   createdAt: string;
 };
 
+export type PlatformDTO = {
+  name: string;
+  mode: "serverless" | "persistent";
+  isVercel: boolean;
+  serverless: boolean;
+  region: string | null;
+  deploymentId: string | null;
+  maxUploadBytes: number;
+  maxFunctionDurationSec: number;
+  tmpBudgetBytes: number | null;
+  supportsLongPolling: boolean;
+  longPollingBlockedReason: string | null;
+  supportsBackgroundDrain: boolean;
+  cronConfigured: boolean;
+};
+
 export type SystemStatusDTO = {
   ffmpeg: {
     available: boolean;
@@ -76,8 +92,17 @@ export type SystemStatusDTO = {
     version: string | null;
     codecs: { libx264: boolean; libx265: boolean };
   };
-  storage: { dir: string };
-  queue: { pending: number; active: number | null; dbActive: number; queued: number };
+  storage: { dir: string; usedBytes: number };
+  queue: {
+    active: number | null;
+    running: boolean;
+    drained: number;
+    lastRunAt: number | null;
+    lastError: string | null;
+    dbActive: number;
+    queued: number;
+  };
+  platform: PlatformDTO;
   poller: {
     running: boolean;
     startedAt: number | null;

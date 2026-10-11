@@ -1,6 +1,7 @@
 import { promises as fs } from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { isServerless } from "@/lib/platform";
 
 export function workDir(): string {
   return process.env.VIDSQUEEZE_DIR || path.join(os.tmpdir(), "vidsqueeze");
@@ -48,21 +49,52 @@ export async function fileSize(file: string): Promise<number> {
   }
 }
 
-/** Remove workdir artefacts older than `maxAgeMs`. */
-export async function cleanupOldFiles(maxAgeMs = 3 * 60 * 60 * 1000): Promise<void> {
+/**
+ * Remove workdir artefacts older than `maxAgeMs`.
+ *
+ * On a long-lived host results are kept for a few hours so the dashboard can
+ * still offer a download. On serverless `/tmp` is tiny (512 MB on Vercel) and
+ * wiped between invocations anyway, so leftovers are dropped much sooner –
+ * including downloaded sources and ffmpeg two-pass logs under `tmp/`.
+ */
+export async function cleanupOldFiles(maxAgeMs = defaultMaxAgeMs()): Promise<void> {
   const dir = await ensureWorkDir();
   const now = Date.now();
-  const entries = await fs.readdir(dir).catch(() => []);
-  for (const entry of entries) {
-    if (!entry.endsWith(".mp4")) continue;
-    const full = path.join(dir, entry);
-    try {
-      const stat = await fs.stat(full);
-      if (now - stat.mtimeMs > maxAgeMs) await fs.unlink(full);
-    } catch {
-      /* ignore */
+
+  const sweep = async (target: string, predicate: (name: string) => boolean) => {
+    const entries = await fs.readdir(target).catch(() => [] as string[]);
+    for (const entry of entries) {
+      if (!predicate(entry)) continue;
+      const full = path.join(target, entry);
+      try {
+        const stat = await fs.stat(full);
+        if (now - stat.mtimeMs > maxAgeMs) await fs.unlink(full);
+      } catch {
+        /* ignore */
+      }
+    }
+  };
+
+  await sweep(dir, (name) => name.endsWith(".mp4"));
+  await sweep(path.join(dir, "tmp"), (name) => name !== "." && name !== "..");
+}
+
+function defaultMaxAgeMs(): number {
+  return isServerless() ? 10 * 60 * 1000 : 3 * 60 * 60 * 1000;
+}
+
+/** Bytes currently held in the work dir – used to warn before a big job. */
+export async function workDirUsage(): Promise<number> {
+  const dir = await ensureWorkDir();
+  let total = 0;
+  for (const sub of [dir, path.join(dir, "tmp")]) {
+    const entries = await fs.readdir(sub).catch(() => [] as string[]);
+    for (const entry of entries) {
+      const stat = await fs.stat(path.join(sub, entry)).catch(() => null);
+      if (stat?.isFile()) total += stat.size;
     }
   }
+  return total;
 }
 
 export function formatBytes(bytes: number): string {
