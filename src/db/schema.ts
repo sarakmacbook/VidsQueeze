@@ -2,6 +2,7 @@ import {
   bigint,
   boolean,
   doublePrecision,
+  index,
   integer,
   pgTable,
   serial,
@@ -92,10 +93,20 @@ export const jobs = pgTable("jobs", {
   error: text("error"),
   log: text("log").notNull().default(""),
 
+  // --- Distributed queue lease ---------------------------------------------
+  // On serverless hosts many functions can look at the queue at once, so a job
+  // is leased to one worker. `lockedAt` older than STALE_LOCK_MINUTES means the
+  // owner was killed mid-encode and the job may be re-claimed.
+  lockedAt: timestamp("locked_at", { withTimezone: true }),
+  lockedBy: text("locked_by"),
+
   startedAt: timestamp("started_at", { withTimezone: true }),
   finishedAt: timestamp("finished_at", { withTimezone: true }),
   createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
-});
+}, (table) => [
+  // The queue drainer scans for the oldest claimable job on every invocation.
+  index("jobs_status_id_idx").on(table.status, table.id),
+]);
 
 /** Lightweight activity feed shown on the dashboard. */
 export const eventLog = pgTable("event_log", {

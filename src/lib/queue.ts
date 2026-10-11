@@ -1,10 +1,21 @@
-import { db } from "@/db";
+import { after } from "next/server";
+import { db, pool } from "@/db";
+import { ensureSchema } from "@/db/migrate";
 import { eventLog, jobs, type JobRow } from "@/db/schema";
 import { desc, eq, sql } from "drizzle-orm";
 import { promises as fs } from "node:fs";
+import os from "node:os";
+import { randomUUID } from "node:crypto";
 import { compressVideo } from "@/lib/compress";
 import { jobInputPath, jobOutputPath, safeUnlink } from "@/lib/storage";
 import { getRawToken, getSettingsRow, parseAllowList } from "@/lib/settings";
+import {
+  MAX_FUNCTION_DURATION_SEC,
+  SHUTDOWN_RESERVE_SEC,
+  STALE_LOCK_MINUTES,
+  isServerless,
+  tmpBudgetBytes,
+} from "@/lib/platform";
 import {
   downloadFile,
   getFile,
@@ -18,11 +29,19 @@ import {
 
 export const TELEGRAM_DOWNLOAD_LIMIT = 20 * 1024 * 1024;
 
+/**
+ * Never start a new encode with less head-room than this – it would be killed
+ * mid-write by the platform and leave a half-finished file behind.
+ */
+const MIN_JOB_WINDOW_MS = 45_000;
+
 type QueueState = {
-  pending: number[];
   active: number | null;
   running: boolean;
   startedAt: number;
+  drained: number;
+  lastRunAt: number | null;
+  lastError: string | null;
 };
 
 const globalForQueue = globalThis as typeof globalThis & {
@@ -31,14 +50,38 @@ const globalForQueue = globalThis as typeof globalThis & {
 
 function state(): QueueState {
   if (!globalForQueue.__vidsqueezeQueue) {
-    globalForQueue.__vidsqueezeQueue = { pending: [], active: null, running: false, startedAt: 0 };
+    globalForQueue.__vidsqueezeQueue = {
+      active: null,
+      running: false,
+      startedAt: 0,
+      drained: 0,
+      lastRunAt: null,
+      lastError: null,
+    };
   }
   return globalForQueue.__vidsqueezeQueue;
 }
 
-export function queueSnapshot(): { pending: number; active: number | null } {
+/**
+ * What *this* instance is doing right now. The authoritative queue depth lives
+ * in Postgres (`queueCounts()`), because on serverless every invocation has its
+ * own empty in-memory view.
+ */
+export function queueSnapshot(): {
+  active: number | null;
+  running: boolean;
+  drained: number;
+  lastRunAt: number | null;
+  lastError: string | null;
+} {
   const s = state();
-  return { pending: s.pending.length, active: s.active };
+  return {
+    active: s.active,
+    running: s.running,
+    drained: s.drained,
+    lastRunAt: s.lastRunAt,
+    lastError: s.lastError,
+  };
 }
 
 export async function logEvent(level: "info" | "warn" | "error" | "success", scope: string, message: string) {
@@ -63,46 +106,198 @@ export async function updateJob(id: number, patch: Partial<JobRow>): Promise<voi
 }
 
 export async function getJob(id: number): Promise<JobRow | null> {
+  await ensureSchema();
   const rows = await db.select().from(jobs).where(eq(jobs.id, id)).limit(1);
   return rows[0] ?? null;
 }
 
 export async function listJobs(limit = 25): Promise<JobRow[]> {
+  await ensureSchema();
   return db.select().from(jobs).orderBy(desc(jobs.id)).limit(limit);
 }
 
-export function enqueue(id: number): void {
-  const s = state();
-  if (s.active === id || s.pending.includes(id)) return;
-  s.pending.push(id);
-  s.pending.sort((a, b) => a - b);
-  void drain();
+export async function queueCounts(): Promise<{ queued: number; active: number }> {
+  await ensureSchema();
+  const rows = await pool.query<{ status: string; c: string }>(
+    `select status, count(*)::text as c from jobs
+      where status in ('queued','downloading','probing','processing','uploading')
+      group by status`,
+  );
+  let queued = 0;
+  let active = 0;
+  for (const row of rows.rows) {
+    if (row.status === "queued") queued += Number(row.c);
+    else active += Number(row.c);
+  }
+  return { queued, active };
 }
 
-async function drain(): Promise<void> {
+// ---------------------------------------------------------------------------
+// Claiming
+// ---------------------------------------------------------------------------
+
+const INSTANCE_ID = `${process.env.VERCEL_DEPLOYMENT_ID ?? os.hostname()}-${process.pid}`;
+
+function workerId(): string {
+  return `${INSTANCE_ID}-${randomUUID().slice(0, 8)}`;
+}
+
+/**
+ * Leases the next runnable job to this worker.
+ *
+ * `FOR UPDATE SKIP LOCKED` stops two *concurrent* transactions from grabbing the
+ * same row, but that alone is not enough: the lease outlives the transaction
+ * that created it. So the predicate also has to treat a leased job as invisible
+ * until its lease goes stale — checking `locked_at is null` for fresh work.
+ * Without it, the same job is handed out over and over and the rest of the queue
+ * starves.
+ *
+ * A lease older than STALE_LOCK_MINUTES means the owning function was killed
+ * mid-encode; those are reclaimed so a crash cannot strand a job forever.
+ */
+async function claimNextJob(worker: string): Promise<number | null> {
+  const result = await pool.query<{ id: number }>(
+    `with next_job as (
+       select id from jobs
+        where (status = 'queued' and locked_at is null)
+           or (locked_at is not null
+               and status in ('queued','downloading','probing','processing','uploading')
+               and locked_at < now() - make_interval(mins => $1::int))
+        order by id
+        for update skip locked
+        limit 1
+     )
+     update jobs
+        set locked_at = now(),
+            locked_by = $2::text,
+            -- Reset to 'queued' so a reclaimed in-flight job passes the guard in
+            -- processJob() and is retried from the top.
+            status = 'queued',
+            error = null
+       from next_job
+      where jobs.id = next_job.id
+      returning jobs.id`,
+    [STALE_LOCK_MINUTES, worker],
+  );
+  return result.rows[0]?.id ?? null;
+}
+
+async function releaseLease(id: number): Promise<void> {
+  await pool
+    .query(`update jobs set locked_at = null, locked_by = null where id = $1::int`, [id])
+    .catch(() => undefined);
+}
+
+// ---------------------------------------------------------------------------
+// Draining
+// ---------------------------------------------------------------------------
+
+export type DrainOptions = {
+  /** Wall-clock ms at which this function invocation started. */
+  invocationStartedAt?: number;
+  /** Stop claiming new jobs after this timestamp. */
+  deadlineMs?: number;
+  maxJobs?: number;
+  reason?: string;
+};
+
+export type DrainResult = { processed: number; skipped: boolean; reason?: string };
+
+/**
+ * Runs queued jobs until the queue is empty or the invocation is about to hit
+ * its `maxDuration`. This is the single entry point used by the Telegram
+ * webhook, the web upload route and the cron safety net.
+ */
+export async function drainQueue(options: DrainOptions = {}): Promise<DrainResult> {
   const s = state();
-  if (s.running) return;
+  if (s.running) return { processed: 0, skipped: true, reason: "another drain is already running here" };
+
+  await ensureSchema();
+
+  const startedAt = options.invocationStartedAt ?? Date.now();
+  const budgetSec = Math.min(
+    MAX_FUNCTION_DURATION_SEC,
+    Number(process.env.MAX_FUNCTION_DURATION_SEC) || MAX_FUNCTION_DURATION_SEC,
+  );
+  const deadline =
+    options.deadlineMs ?? startedAt + Math.max(30, budgetSec - SHUTDOWN_RESERVE_SEC) * 1000;
+  const maxJobs = options.maxJobs ?? Number.POSITIVE_INFINITY;
+
   s.running = true;
+  s.startedAt = startedAt;
+  let processed = 0;
+  const worker = workerId();
+
   try {
-    while (s.pending.length > 0) {
-      const id = s.pending.shift() as number;
+    while (processed < maxJobs) {
+      const remaining = deadline - Date.now();
+      if (remaining < MIN_JOB_WINDOW_MS) {
+        const reason = `invocation budget exhausted after ${processed} job(s) – the rest stays queued`;
+        s.lastError = null;
+        await logEvent("warn", "queue", reason);
+        return { processed, skipped: false, reason };
+      }
+
+      const id = await claimNextJob(worker);
+      if (id === null) break;
+
       s.active = id;
       try {
-        await processJob(id);
+        await processJob(id, { deadlineMs: deadline });
+        processed += 1;
+        s.drained += 1;
       } catch (err) {
+        const message = err instanceof Error ? err.message : String(err);
+        s.lastError = message;
         await updateJob(id, {
           status: "error",
           stage: "Failed",
-          error: err instanceof Error ? err.message : String(err),
+          error: message,
           finishedAt: new Date(),
         }).catch(() => undefined);
+        await logEvent("error", "queue", `Job #${id} failed: ${message}`);
       } finally {
         s.active = null;
+        await releaseLease(id);
       }
     }
+    s.lastRunAt = Date.now();
+    s.lastError = null;
+    return { processed, skipped: false };
   } finally {
     s.running = false;
   }
+}
+
+/**
+ * Kicks the queue without blocking the caller.
+ *
+ * On Vercel the work runs inside `after()`, which keeps the *same* invocation
+ * alive (and billed, up to `maxDuration`) once the HTTP response has been sent.
+ * That is what lets a Telegram webhook answer in milliseconds and still encode
+ * the clip. Outside a request scope – the poller, a CLI script – we simply
+ * detach the promise.
+ */
+export function scheduleDrain(reason = "job enqueued", options: DrainOptions = {}): void {
+  const invocationStartedAt = options.invocationStartedAt ?? Date.now();
+  const task = () =>
+    drainQueue({ ...options, invocationStartedAt, reason }).catch(async (err) => {
+      const message = err instanceof Error ? err.message : String(err);
+      state().lastError = message;
+      await logEvent("error", "queue", `Drain failed (${reason}): ${message}`);
+    });
+
+  try {
+    after(() => task());
+  } catch {
+    // `after()` is only available inside a request scope.
+    void task();
+  }
+}
+
+/** Kept for callers that only want the persistent-server behaviour. */
+export function enqueue(id: number): void {
+  scheduleDrain(`job #${id} enqueued`);
 }
 
 function buildCaption(template: string, sourceName: string, sourceBytes: number, outputBytes: number): string {
@@ -115,8 +310,15 @@ function buildCaption(template: string, sourceName: string, sourceBytes: number,
     .replaceAll("{saved}", String(saved));
 }
 
+/**
+ * Invocation clock, threaded explicitly (never via module state) so that two
+ * concurrent requests sharing one warm instance cannot inherit each other's
+ * deadline.
+ */
+export type RequestContext = DrainOptions;
+
 /** Full pipeline: download (telegram) → compress → upload / store result. */
-export async function processJob(id: number): Promise<void> {
+export async function processJob(id: number, options: { deadlineMs?: number } = {}): Promise<void> {
   const job = await getJob(id);
   if (!job) return;
   // Only fresh (or previously failed) jobs are processed.
@@ -139,6 +341,20 @@ export async function processJob(id: number): Promise<void> {
   const outputPath = job.outputPath || jobOutputPath(id, job.fileName);
 
   try {
+    // Serverless scratch space is small and shared with the output file, so
+    // refuse work that cannot possibly fit instead of filling the disk.
+    const budget = tmpBudgetBytes();
+    if (Number.isFinite(budget)) {
+      const needed = job.sourceBytes + Math.max(job.targetBytes, job.sourceBytes * 0.5);
+      if (needed > budget) {
+        throw new Error(
+          `This job needs roughly ${(needed / 1024 / 1024).toFixed(0)} MB of scratch space but only ` +
+            `${(budget / 1024 / 1024).toFixed(0)} MB is available on ${isServerless() ? "this serverless host" : "this host"}. ` +
+            `Lower the target size or run the encoder on a long-lived host.`,
+        );
+      }
+    }
+
     if (job.source === "telegram") {
       if (!token) throw new Error("Bot token is not configured – finish setup first");
       if (!job.telegramFileId) throw new Error("Missing Telegram file id");
@@ -177,6 +393,9 @@ export async function processJob(id: number): Promise<void> {
       profile,
       // The per-job budget wins so a job keeps the settings it was created with.
       targetBytes: job.targetBytes > 0 ? job.targetBytes : undefined,
+      // Stop the encoder before the platform stops us, so the failure is a
+      // readable message in the dashboard rather than a truncated invocation.
+      deadlineMs: options.deadlineMs,
       onProgress: async (update) => {
         const now = Date.now();
         if (now - lastWrite < 700 && update.progress < 98) return;
@@ -234,11 +453,12 @@ export async function processJob(id: number): Promise<void> {
       await sendMessage(token, job.telegramChatId, `⚠️ <b>Compression failed</b>\n${message}`).catch(() => undefined);
     }
     await safeUnlink(inputPath);
+    await safeUnlink(outputPath);
   }
 }
 
 /** Handle an incoming Telegram message coming from either webhook or polling. */
-export async function handleMessage(message: TgMessage): Promise<string> {
+export async function handleMessage(message: TgMessage, context: RequestContext = {}): Promise<string> {
   const settings = await getSettingsRow();
   const token = await getRawToken();
   const chatId = message.chat.id;
@@ -297,16 +517,23 @@ export async function handleMessage(message: TgMessage): Promise<string> {
     telegramFileId: video.file.file_id,
   });
 
-  enqueue(job.id);
   await logEvent("info", "bot", `Queued job #${job.id} from ${user?.username ?? chatId}`);
   await sendMessage(token, chatId, `📥 Got it – job #${job.id} queued. I will send the compressed video here.`).catch(
     () => undefined,
   );
+
+  // The webhook route schedules its own drain with an accurate invocation
+  // clock; this covers the long-polling path, where there is no request scope.
+  scheduleDrain(`telegram job #${job.id}`, context);
+
   return `queued:${job.id}`;
 }
 
-export async function handleTelegramUpdate(update: { update_id: number; message?: TgMessage }): Promise<void> {
-  if (update.message) await handleMessage(update.message);
+export async function handleTelegramUpdate(
+  update: { update_id: number; message?: TgMessage },
+  context: RequestContext = {},
+): Promise<void> {
+  if (update.message) await handleMessage(update.message, context);
 }
 
 export { TelegramError };

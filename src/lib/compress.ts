@@ -31,6 +31,12 @@ export type CompressArgs = {
   onProgress?: (update: ProgressUpdate) => void | Promise<void>;
   onLog?: (line: string) => void | Promise<void>;
   signal?: AbortSignal;
+  /**
+   * Wall-clock ms after which the platform kills this invocation. Each pass is
+   * given only the time that is actually left, so a too-slow encode fails with
+   * a readable message instead of being cut off mid-write.
+   */
+  deadlineMs?: number;
 };
 
 export type CompressResult = {
@@ -48,6 +54,10 @@ export type CompressResult = {
 const AUDIO_OVERHEAD_FACTOR = 0.985;
 const MIN_VIDEO_BPS = 12_000;
 const MAX_ATTEMPTS = 3;
+/** Generous ceiling for a long-lived host; serverless uses its own deadline. */
+const DEFAULT_PASS_TIMEOUT_MS = 30 * 60 * 1000;
+/** Below this there is no point starting another pass. */
+const MIN_PASS_TIMEOUT_MS = 15_000;
 
 function even(value: number): number {
   return Math.max(2, Math.round(value / 2) * 2);
@@ -171,6 +181,18 @@ export async function compressVideo(args: CompressArgs): Promise<CompressResult>
   if (!bins) throw new Error("ffmpeg binaries unavailable – install ffmpeg or set FFMPEG_PATH");
 
   const { inputPath, outputPath, profile, onProgress, onLog, signal } = args;
+
+  /** Time budget for a single ffmpeg pass. */
+  const passTimeout = (): number => {
+    const remaining = args.deadlineMs ? args.deadlineMs - Date.now() : DEFAULT_PASS_TIMEOUT_MS;
+    if (remaining < MIN_PASS_TIMEOUT_MS) {
+      throw new Error(
+        `Ran out of time before the encode could finish (only ${Math.max(0, Math.round(remaining / 1000))}s left). ` +
+          `Shorten the clip, lower the resolution, disable two-pass encoding, or run on a host with a longer limit.`,
+      );
+    }
+    return Math.min(DEFAULT_PASS_TIMEOUT_MS, remaining);
+  };
   const log: string[] = [];
   const write = async (line: string) => {
     log.push(line);
@@ -246,7 +268,7 @@ export async function compressVideo(args: CompressArgs): Promise<CompressResult>
     await write(`ffmpeg ${cmd.filter((c) => c !== inputPath && c !== outPath).join(" ")}`);
 
     const res = await run(bins.ffmpeg, cmd, {
-      timeoutMs: 30 * 60 * 1000,
+      timeoutMs: passTimeout(),
       signal,
       onStdout: progressReader(probe.durationSec, from, to, async (fraction) => {
         const share = from + (to - from) * fraction;

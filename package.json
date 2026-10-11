@@ -1,12 +1,23 @@
 {
-  "name": "nextjs-postgresql-template",
+  "name": "vidsqueeze",
+  "version": "1.0.0",
   "private": true,
+  "description": "Telegram bot that shrinks iPhone videos with a two-pass ffmpeg encode. Next.js + Postgres (Drizzle), deployable on Vercel or any long-lived host.",
+  "engines": {
+    "node": ">=20.9.0"
+  },
   "scripts": {
     "dev": "next dev",
     "build": "next build",
     "start": "next start",
     "lint": "eslint .",
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit",
+    "db:push": "drizzle-kit push",
+    "db:generate": "drizzle-kit generate",
+    "db:migrate": "drizzle-kit migrate",
+    "db:studio": "drizzle-kit studio",
+    "verify:bundle": "node scripts/check-vercel-bundle.mjs",
+    "deploy:check": "npm run typecheck && npm run build && npm run verify:bundle"
   },
   "dependencies": {
     "dotenv": "17.3.1",

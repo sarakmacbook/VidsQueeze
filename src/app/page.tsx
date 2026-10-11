@@ -101,7 +101,7 @@ export default function DashboardPage() {
     );
   }
 
-  const { settings, ffmpeg, stats, queue, poller } = status;
+  const { settings, ffmpeg, stats, queue, poller, platform } = status;
   const checklist = [
     {
       label: "ffmpeg encoder available",
@@ -114,16 +114,28 @@ export default function DashboardPage() {
       detail: settings.botUsername ?? "no token saved",
     },
     {
-      label: settings.connectionMode === "webhook" ? "Webhook registered" : "Long-poll listener running",
-      ok: settings.connectionMode === "webhook" ? Boolean(settings.publicBaseUrl) && !poller.lastError : poller.running,
+      label:
+        settings.connectionMode === "webhook"
+          ? "Webhook registered"
+          : platform.supportsLongPolling
+            ? "Long-poll listener running"
+            : `Webhook required on ${platform.name}`,
+      ok:
+        settings.connectionMode === "webhook"
+          ? Boolean(settings.publicBaseUrl) && !poller.lastError
+          : platform.supportsLongPolling
+            ? poller.running
+            : false,
       detail:
         settings.connectionMode === "webhook"
           ? settings.publicBaseUrl
             ? `${settings.publicBaseUrl}/api/telegram/webhook`
             : "set a public HTTPS base URL"
-          : poller.running
-            ? `listening · ${poller.processed} updates`
-            : "listener stopped",
+          : platform.supportsLongPolling
+            ? poller.running
+              ? `listening · ${poller.processed} updates`
+              : "listener stopped"
+            : platform.longPollingBlockedReason ?? "long polling is unavailable on this host",
     },
     {
       label: "Compression profile configured",
@@ -156,6 +168,17 @@ export default function DashboardPage() {
 
       {notice && <Alert tone={notice.tone}>{notice.text}</Alert>}
 
+      {platform.serverless && (
+        <Alert tone="info">
+          <b>{platform.name}</b>
+          {platform.region ? ` · ${platform.region}` : ""} runs short-lived functions, so VidSqueeze switches to
+          webhook mode and a Postgres-backed queue. One encode may use up to {platform.maxFunctionDurationSec}s, the
+          browser test bench accepts {formatBytes(platform.maxUploadBytes)}
+          {platform.tmpBudgetBytes ? `, and scratch space is capped at ${formatBytes(platform.tmpBudgetBytes)}` : ""}.
+          The Telegram bot itself is unaffected – it streams files straight from Telegram.
+        </Alert>
+      )}
+
       {!ready && (
         <Alert tone="warn">
           Setup is not finished.{" "}
@@ -186,23 +209,44 @@ export default function DashboardPage() {
               ? "Webhook"
               : poller.running
                 ? "Polling"
-                : "Offline"
+                : platform.supportsLongPolling
+                  ? "Offline"
+                  : "Blocked"
           }
-          tone={settings.connectionMode === "webhook" ? (poller.lastError ? "warn" : "good") : poller.running ? "good" : "warn"}
+          tone={
+            settings.connectionMode === "webhook"
+              ? poller.lastError
+                ? "warn"
+                : "good"
+              : poller.running
+                ? "good"
+                : platform.supportsLongPolling
+                  ? "warn"
+                  : "bad"
+          }
           hint={
             settings.connectionMode === "webhook"
               ? poller.lastError
                 ? `webhook error: ${poller.lastError.slice(0, 40)}`
                 : "waiting for Telegram calls"
-              : poller.running
-                ? `last poll ${relativeTime(poller.lastPollAt ? new Date(poller.lastPollAt).toISOString() : null)}`
-                : "start it to receive videos"
+              : platform.supportsLongPolling
+                ? poller.running
+                  ? `last poll ${relativeTime(poller.lastPollAt ? new Date(poller.lastPollAt).toISOString() : null)}`
+                  : "start it to receive videos"
+                : "serverless host – register the webhook"
           }
         />
         <Stat
           label="Queue"
-          value={`${queue.active !== null ? 1 : 0} / ${queue.pending}`}
-          hint={`${queue.dbActive} processing · ${queue.queued} queued`}
+          value={`${queue.dbActive} / ${queue.queued}`}
+          tone={queue.lastError ? "warn" : "default"}
+          hint={
+            queue.lastError
+              ? `last error: ${queue.lastError.slice(0, 46)}`
+              : platform.serverless
+                ? `${queue.queued} waiting · drained per invocation`
+                : `${queue.dbActive} processing · ${queue.queued} queued`
+          }
         />
       </div>
 
@@ -256,9 +300,13 @@ export default function DashboardPage() {
               <button className="btn-danger" disabled={busy !== null} onClick={() => void control("stop")}>
                 ■ Stop listener
               </button>
-            ) : (
+            ) : platform.supportsLongPolling ? (
               <button className="btn-primary" disabled={busy !== null} onClick={() => void control("start")}>
                 ▶ Start listener (long polling)
+              </button>
+            ) : (
+              <button className="btn-primary" disabled={busy !== null} onClick={() => void control("webhook")}>
+                ⇪ Register webhook instead
               </button>
             )}
           </div>

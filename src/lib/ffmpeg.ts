@@ -1,14 +1,68 @@
 import { spawn } from "node:child_process";
-import { existsSync } from "node:fs";
+import { accessSync, constants as fsConstants, existsSync, copyFileSync, chmodSync, mkdirSync } from "node:fs";
 import { createRequire } from "node:module";
+import path from "node:path";
+import os from "node:os";
 
 export type FfmpegBinaries = { ffmpeg: string; ffprobe: string };
 
+/**
+ * `require` exists in Next's CJS server output but not in a pure ESM build, so
+ * resolve it once and fall back to a `createRequire` rooted at the app. On
+ * Vercel that is `/var/task`, which is exactly where `node_modules` lives.
+ */
+const nodeRequire: NodeRequire =
+  typeof require === "function" ? require : createRequire(path.join(process.cwd(), "vidsqueeze.cjs"));
+
+/** Where we stash a copy when the bundled binary is present but not executable. */
+function escapeDir(): string {
+  return path.join(os.tmpdir(), "vidsqueeze-bin");
+}
+
+/**
+ * Returns a path we are actually allowed to `spawn`.
+ *
+ * Serverless filesystems are read-only outside `/tmp`, and files pulled in by
+ * output-file-tracing do not always keep their executable bit. Rather than
+ * failing, copy the binary to `/tmp` (writable *and* executable on Vercel) and
+ * chmod it there. The copy is cached per instance.
+ */
+function ensureExecutable(bin: string): string | null {
+  if (!existsSync(bin)) return null;
+  try {
+    // Already runnable – the common case on a normal host.
+    if (canExec(bin)) return bin;
+    chmodSync(bin, 0o755);
+    if (canExec(bin)) return bin;
+  } catch {
+    /* read-only filesystem – fall through to the /tmp copy */
+  }
+
+  try {
+    const dir = escapeDir();
+    mkdirSync(dir, { recursive: true });
+    const target = path.join(dir, path.basename(bin));
+    if (!existsSync(target)) copyFileSync(bin, target);
+    chmodSync(target, 0o755);
+    return canExec(target) ? target : null;
+  } catch {
+    return null;
+  }
+}
+
+function canExec(file: string): boolean {
+  try {
+    accessSync(file, fsConstants.X_OK);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 function fromStatic(): FfmpegBinaries | null {
   try {
-   
-    const ffmpeg = require("ffmpeg-static") as string | null;
-    const ffprobeMod = require("ffprobe-static") as { path?: string } | null;
+    const ffmpeg = nodeRequire("ffmpeg-static") as string | null;
+    const ffprobeMod = nodeRequire("ffprobe-static") as { path?: string } | null;
     const ffprobe = ffprobeMod?.path;
     if (ffmpeg && ffprobe && existsSync(ffmpeg) && existsSync(ffprobe)) {
       return { ffmpeg, ffprobe };
@@ -35,7 +89,9 @@ export function binaries(): FfmpegBinaries | null {
   candidates.push({ ffmpeg: "ffmpeg", ffprobe: "ffprobe" });
 
   for (const candidate of candidates) {
-    if (candidate.ffmpeg === "ffmpeg" || candidate.ffprobe === "ffprobe") {
+    const isPathLookup = candidate.ffmpeg === "ffmpeg" || candidate.ffprobe === "ffprobe";
+
+    if (isPathLookup) {
       // Only trust PATH binaries if they are actually runnable.
       try {
         execOk(candidate.ffmpeg, ["-hide_banner", "-version"]);
@@ -43,8 +99,21 @@ export function binaries(): FfmpegBinaries | null {
       } catch {
         continue;
       }
+      cached = candidate;
+      return cached;
     }
-    cached = candidate;
+
+    // Bundled/absolute paths: make sure they exist and can be executed here.
+    const ffmpeg = ensureExecutable(candidate.ffmpeg);
+    const ffprobe = ensureExecutable(candidate.ffprobe);
+    if (!ffmpeg || !ffprobe) continue;
+    try {
+      execOk(ffmpeg, ["-hide_banner", "-version"]);
+      execOk(ffprobe, ["-hide_banner", "-version"]);
+    } catch {
+      continue;
+    }
+    cached = { ffmpeg, ffprobe };
     return cached;
   }
   cached = null;
@@ -58,7 +127,7 @@ function execOk(bin: string, args: string[]): void {
 
 function spawnSyncSafe(bin: string, args: string[], timeoutMs: number) {
   // Lazy require keeps this module usable in edge-ish bundling contexts.
-  const { spawnSync } = require("node:child_process") as typeof import("node:child_process");
+  const { spawnSync } = nodeRequire("node:child_process") as typeof import("node:child_process");
   return spawnSync(bin, args, { timeout: timeoutMs, encoding: "utf8" });
 }
 

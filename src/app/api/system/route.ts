@@ -5,9 +5,10 @@ import { count, eq, sql } from "drizzle-orm";
 import { binaries, codecAvailable, ffmpegVersion } from "@/lib/ffmpeg";
 import { getSettingsRow, toPublicSettings } from "@/lib/settings";
 import { pollerSnapshot } from "@/lib/poller";
-import { queueSnapshot } from "@/lib/queue";
+import { queueCounts, queueSnapshot } from "@/lib/queue";
 import { autoResume } from "@/lib/poller";
-import { cleanupOldFiles, workDir } from "@/lib/storage";
+import { cleanupOldFiles, workDir, workDirUsage } from "@/lib/storage";
+import { platformInfo } from "@/lib/platform";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -60,7 +61,10 @@ export async function buildStatus() {
     .from(jobs)
     .where(eq(jobs.status, "processing"));
 
+  const live = await queueCounts().catch(() => ({ queued: stats.queued, active: stats.active }));
+
   return {
+    platform: platformInfo(),
     ffmpeg: {
       available: Boolean(bins),
       ffmpegPath: bins?.ffmpeg ?? null,
@@ -68,8 +72,12 @@ export async function buildStatus() {
       version,
       codecs: { libx264: h264, libx265: h265 },
     },
-    storage: { dir: workDir() },
-    queue: { ...queueSnapshot(), dbActive: Number(runningNow[0]?.c ?? 0), queued: stats.queued },
+    storage: { dir: workDir(), usedBytes: await workDirUsage().catch(() => 0) },
+    queue: {
+      ...queueSnapshot(),
+      dbActive: Number(runningNow[0]?.c ?? 0),
+      queued: live.queued,
+    },
     poller: pollerSnapshot(),
     stats,
     settings: toPublicSettings(settings),
